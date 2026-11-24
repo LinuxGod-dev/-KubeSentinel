@@ -1,0 +1,44 @@
+name: ci
+on: [push, pull_request]
+
+permissions:
+  contents: read
+  security-events: write   # needed to upload SARIF to the Security tab
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  scan-demo:
+    # Demonstrates the CI gate: scan the intentionally vulnerable lab and publish SARIF.
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e .
+      - run: kubesentinel scan labs/vulnerable --quiet --sarif kubesentinel.sarif --html report.html --fail-on none
+      - uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: kubesentinel.sarif, category: kubesentinel-demo }
+      - uses: actions/upload-artifact@v4
+        with: { name: kubesentinel-report, path: report.html }
+
+  falco-rules-validate:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # advisory until confirmed on your Falco version
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Falco rule syntax
+        run: |
+          docker run --rm -v "$PWD/rules/falco:/rules:ro" falcosecurity/falco-no-driver:latest \
+            falco --validate /rules/kubesentinel_rules.yaml

@@ -1,0 +1,46 @@
+# A hardened reference namespace: the scanner should report (almost) nothing here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: payments-api, namespace: payments }
+automountServiceAccountToken: false
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: payments }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: payments-api, namespace: payments }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: payments-api } }
+  template:
+    metadata: { labels: { app: payments-api } }
+    spec:
+      serviceAccountName: payments-api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: busybox:1.36.1
+          command: ["sleep", "infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }

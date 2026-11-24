@@ -1,0 +1,194 @@
+# KubeSentinel runtime detection rules for Falco (syscall-based).
+# Each rule is linked from the posture finding it detects exploitation of:  kubesentinel rules
+# Self-contained: all macros/lists are prefixed ks_ so this file can sit next to Falco's default rules.
+# Validate before use:   falco --validate rules/falco/kubesentinel_rules.yaml
+# Tune the ks_*_allowed_* lists below for your environment to cut false positives.
+
+- required_engine_version: 0.31.0
+
+# ----------------------------------------------------------------------------- lists
+- list: ks_shell_binaries
+  items: [bash, sh, zsh, ash, dash, ksh, csh, tcsh, fish]
+
+- list: ks_token_reader_binaries
+  items: [cat, head, tail, less, more, base64, strings, xxd, cp, tar, awk, sed, grep]
+
+- list: ks_pkg_mgmt_binaries
+  items: [apt, apt-get, dpkg, apk, yum, dnf, rpm, microdnf, zypper]
+
+- list: ks_miner_binaries
+  items: [xmrig, minerd, cpuminer, cpuminer-multi, ethminer, ccminer, nbminer, t-rex, lolMiner]
+
+- list: ks_runtime_socket_fragments
+  items: ["docker.sock", "containerd.sock", "crio.sock"]
+
+# Processes that legitimately write below /etc or into binary dirs (extend for your images)
+- list: ks_write_allowed_procs
+  items: [envsubst, update-ca-certificates, ldconfig, ca-certificates, useradd, groupadd]
+
+# Processes that legitimately read /etc/shadow
+- list: ks_shadow_allowed_procs
+  items: [su, sudo, login, passwd, sshd, unix_chkpwd, chpasswd, useradd, usermod, groupadd]
+
+# ----------------------------------------------------------------------------- macros
+- macro: ks_container
+  condition: (container.id != host)
+
+- macro: ks_spawned_process
+  condition: (evt.type in (execve, execveat) and evt.dir=<)
+
+- macro: ks_open_read
+  condition: (evt.type in (open, openat, openat2) and evt.is_open_read=true and fd.typechar='f' and fd.num>=0)
+
+- macro: ks_open_write
+  condition: (evt.type in (open, openat, openat2) and evt.is_open_write=true and fd.typechar='f' and fd.num>=0)
+
+- macro: ks_sa_token_path
+  condition: (fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount or fd.name startswith /run/secrets/kubernetes.io/serviceaccount)
+
+# ----------------------------------------------------------------------------- rules
+- rule: KubeSentinel Interactive Shell in Container
+  desc: >
+    An interactive shell (attached TTY) was started inside a container, typically via kubectl exec -it.
+    Maps to ATT&CK T1609 (Container Administration Command). Pairs with KS-RBAC-005.
+  condition: ks_spawned_process and ks_container and proc.name in (ks_shell_binaries) and proc.tty != 0
+  output: >
+    Interactive shell in container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name container=%container.name
+    image=%container.image.repository shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline)
+  priority: NOTICE
+  tags: [kubesentinel, container, shell, mitre_execution, T1609]
+
+- rule: KubeSentinel ServiceAccount Token Read by Suspicious Process
+  desc: >
+    A utility commonly used for manual credential theft (cat, base64, tar, ...) read the pod's ServiceAccount
+    token. Applications read the token via their client libraries; humans and droppers use shell tools.
+    ATT&CK T1552.007.
+  condition: ks_open_read and ks_container and ks_sa_token_path and proc.name in (ks_token_reader_binaries)
+  output: >
+    ServiceAccount token read by shell utility (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name proc=%proc.name file=%fd.name cmdline=%proc.cmdline)
+  priority: WARNING
+  tags: [kubesentinel, container, credentials, mitre_credential_access, T1552.007]
+
+- rule: KubeSentinel Write to Sensitive Directory in Container
+  desc: >
+    A process wrote below /etc or into a system binary directory inside a container. Containers should be
+    immutable at runtime (see KS-WL-007 readOnlyRootFilesystem).
+  condition: >
+    ks_open_write and ks_container
+    and (fd.name startswith /etc/ or fd.directory in (/bin, /sbin, /usr/bin, /usr/sbin, /usr/local/bin))
+    and not proc.name in (ks_write_allowed_procs)
+  output: >
+    Write to sensitive path in container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name proc=%proc.name file=%fd.name)
+  priority: WARNING
+  tags: [kubesentinel, container, filesystem, mitre_persistence, T1546]
+
+- rule: KubeSentinel Package Manager Run in Container
+  desc: >
+    A package manager was executed inside a running container, a common step when an attacker installs tooling
+    after gaining a shell.
+  condition: ks_spawned_process and ks_container and proc.name in (ks_pkg_mgmt_binaries)
+  output: >
+    Package manager launched in container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name proc=%proc.name cmdline=%proc.cmdline)
+  priority: NOTICE
+  tags: [kubesentinel, container, execution, mitre_execution, T1072]
+
+- rule: KubeSentinel Crypto Miner Activity in Container
+  desc: >
+    A known miner binary, or a command line carrying mining-pool arguments (stratum, --donate-level), was
+    executed in a container. ATT&CK T1496 (Resource Hijacking). Pairs with KS-WL-008 (no resource limits).
+  condition: >
+    ks_spawned_process and ks_container
+    and (proc.name in (ks_miner_binaries)
+         or proc.cmdline contains "stratum+tcp"
+         or proc.cmdline contains "stratum+ssl"
+         or proc.cmdline contains "--donate-level")
+  output: >
+    Crypto miner activity in container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name proc=%proc.name cmdline=%proc.cmdline)
+  priority: CRITICAL
+  tags: [kubesentinel, container, cryptomining, mitre_impact, T1496]
+
+- rule: KubeSentinel Container Escape via nsenter
+  desc: >
+    nsenter was used to join the namespaces of PID 1 (the host init) from inside a container. This is the standard
+    escape from a privileged pod with hostPID. ATT&CK T1611. Pairs with KS-WL-001 / KS-WL-002.
+  condition: >
+    ks_spawned_process and ks_container and proc.name = nsenter
+    and (proc.cmdline contains " -t 1 " or proc.cmdline contains "--target 1" or proc.cmdline contains "--target=1")
+  output: >
+    nsenter into host PID 1 from container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name cmdline=%proc.cmdline)
+  priority: CRITICAL
+  tags: [kubesentinel, container, escape, mitre_privilege_escalation, T1611]
+
+- rule: KubeSentinel Mount Syscall in Container
+  desc: >
+    A process inside a container invoked mount(2). Needs CAP_SYS_ADMIN, so it signals a privileged or
+    over-capable container attempting to mount host devices or filesystems. ATT&CK T1611.
+  condition: evt.type = mount and evt.dir = < and ks_container
+  output: >
+    mount syscall in container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name container=%container.name
+    proc=%proc.name cmdline=%proc.cmdline result=%evt.res)
+  priority: WARNING
+  tags: [kubesentinel, container, escape, mitre_privilege_escalation, T1611]
+
+- rule: KubeSentinel Container Runtime Socket Connection
+  desc: >
+    A container connected to the Docker/containerd/CRI-O socket (mounted via hostPath). Control of the runtime
+    socket equals root on the node. Pairs with KS-WL-003.
+  condition: >
+    evt.type = connect and evt.dir = < and ks_container and fd.sockfamily = unix
+    and (fd.name contains "docker.sock" or fd.name contains "containerd.sock" or fd.name contains "crio.sock")
+  output: >
+    Container runtime socket connection (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name proc=%proc.name socket=%fd.name)
+  priority: CRITICAL
+  tags: [kubesentinel, container, escape, mitre_privilege_escalation, T1611]
+
+- rule: KubeSentinel Kubernetes API Client in Container
+  desc: >
+    kubectl, or curl/wget aimed at the in-cluster API server, ran inside a container. Workloads normally use client
+    libraries; interactive API access from a pod suggests an attacker pivoting with the mounted token.
+    ATT&CK T1613 / T1609.
+  condition: >
+    ks_spawned_process and ks_container
+    and (proc.name = kubectl
+         or (proc.name in (curl, wget)
+             and (proc.cmdline contains "kubernetes.default" or proc.cmdline contains "/api/v1/")))
+  output: >
+    Kubernetes API client in container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name proc=%proc.name cmdline=%proc.cmdline)
+  priority: WARNING
+  tags: [kubesentinel, container, discovery, mitre_discovery, T1613]
+
+- rule: KubeSentinel Reverse Shell in Container
+  desc: >
+    A standard stream (stdin/stdout/stderr) was redirected to a network socket inside a container, the signature
+    of a reverse shell. Pairs with KS-NET-001 (no egress controls).
+  condition: >
+    evt.type in (dup, dup2, dup3) and evt.dir = < and ks_container
+    and fd.num in (0, 1, 2) and fd.type in (ipv4, ipv6)
+  output: >
+    Standard stream redirected to network in container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name proc=%proc.name connection=%fd.name cmdline=%proc.cmdline)
+  priority: CRITICAL
+  tags: [kubesentinel, container, shell, mitre_execution, T1059]
+
+- rule: KubeSentinel Sensitive Credential File Read in Container
+  desc: >
+    A container process read a host-credential file such as /etc/shadow, an SSH private key or a kubeconfig.
+    Frequently seen after a hostPath mount of / or /etc (KS-WL-003).
+  condition: >
+    ks_open_read and ks_container
+    and (fd.name in (/etc/shadow, /root/.ssh/id_rsa, /root/.ssh/id_ed25519, /root/.kube/config,
+                     /etc/kubernetes/admin.conf, /etc/kubernetes/pki/ca.key)
+         or fd.name startswith /host/etc/shadow)
+    and not proc.name in (ks_shadow_allowed_procs)
+  output: >
+    Sensitive credential file read in container (user=%user.name ns=%k8s.ns.name pod=%k8s.pod.name
+    container=%container.name proc=%proc.name file=%fd.name)
+  priority: WARNING
+  tags: [kubesentinel, container, credentials, mitre_credential_access, T1552.001]

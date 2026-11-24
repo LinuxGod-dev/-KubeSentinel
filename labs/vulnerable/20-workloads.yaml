@@ -1,0 +1,66 @@
+# Deliberately insecure workloads. LAB USE ONLY - do not deploy outside a throw-away cluster.
+apiVersion: v1
+kind: Pod
+metadata: { name: attacker-pod, namespace: dev, labels: { app: attacker } }
+spec:
+  hostPID: true
+  containers:
+    - name: shell
+      image: alpine:3.20
+      command: ["sleep", "infinity"]
+      securityContext: { privileged: true }
+      volumeMounts:
+        - { name: containerd-sock, mountPath: /run/containerd/containerd.sock }
+  volumes:
+    - name: containerd-sock
+      hostPath: { path: /run/containerd/containerd.sock }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: payments-api, namespace: dev }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: payments-api } }
+  template:
+    metadata: { labels: { app: payments-api } }
+    spec:
+      serviceAccountName: ci-runner
+      containers:
+        - name: api
+          image: nginx:latest
+          securityContext: { runAsUser: 0, capabilities: { add: ["SYS_ADMIN", "NET_ADMIN"] } }
+          env:
+            - { name: DB_PASSWORD, value: "Sup3rS3cretPassw0rd!" }
+            - { name: BACKUP_KEY, value: "AKIAIOSFODNN7EXAMPLE" }
+            - { name: LOG_LEVEL, value: "debug" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: backup-agent, namespace: ops }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: backup-agent } }
+  template:
+    metadata: { labels: { app: backup-agent } }
+    spec:
+      serviceAccountName: backup
+      containers:
+        - name: agent
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: app-config, namespace: dev }
+data:
+  log_format: json
+  db_password: hunter2
+  cloud_credentials: "AKIAIOSFODNN7EXAMPLE"
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: db-creds, namespace: dev }
+type: Opaque
+stringData:
+  username: admin
+  password: not-a-real-password

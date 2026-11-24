@@ -1,0 +1,132 @@
+# Deliberately over-permissioned RBAC. LAB USE ONLY.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ci-runner, namespace: dev }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: tiller, namespace: dev }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: support-bot, namespace: dev }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: backup, namespace: ops }
+---
+# 1) CI identity may create workloads in dev
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: ci-deployer, namespace: dev }
+rules:
+  - apiGroups: ["", "apps"]
+    resources: ["pods", "deployments"]
+    verbs: ["get", "list", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: ci-runner-deployer, namespace: dev }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: ci-deployer }
+subjects:
+  - { kind: ServiceAccount, name: ci-runner, namespace: dev }
+---
+# 2) ...and tiller (same namespace) is cluster-admin  =>  ci-runner -> tiller -> CLUSTER_ADMIN
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: tiller-admin }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin }
+subjects:
+  - { kind: ServiceAccount, name: tiller, namespace: dev }
+---
+# 3) support-bot may exec into pods in ops; a pod there runs as ops/backup which reads all Secrets
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: debug, namespace: ops }
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: support-bot-debug, namespace: ops }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: debug }
+subjects:
+  - { kind: ServiceAccount, name: support-bot, namespace: dev }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: secret-reader }
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: backup-secret-reader }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: secret-reader }
+subjects:
+  - { kind: ServiceAccount, name: backup, namespace: ops }
+---
+# 4) A "RBAC manager" that can edit roles and bind anything
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: rbac-manager }
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "roles"]
+    verbs: ["escalate", "bind", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings", "rolebindings"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: alice-rbac-manager }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: rbac-manager }
+subjects:
+  - { kind: User, name: alice, apiGroup: rbac.authorization.k8s.io }
+---
+# 5) A group with the built-in "edit" role in dev (can create pods + read secrets there)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: contractors-edit, namespace: dev }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edit }
+subjects:
+  - { kind: Group, name: contractors, apiGroup: rbac.authorization.k8s.io }
+---
+# 6) Role bound to the default ServiceAccount + broad group + wildcard verbs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: default-sa-view, namespace: dev }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: view }
+subjects:
+  - { kind: ServiceAccount, name: default, namespace: dev }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: pod-reader }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: everyone-reads-pods }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: pod-reader }
+subjects:
+  - { kind: Group, name: "system:authenticated", apiGroup: rbac.authorization.k8s.io }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: ops-wildcard }
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "configmaps"]
+    verbs: ["*"]
