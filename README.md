@@ -1,294 +1,360 @@
 # KubeSentinel
 
-**Kubernetes security posture scanner with RBAC escalation-path analysis and linked Falco runtime detections.**
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![CI](https://github.com/LinuxGod-dev/kubesentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/LinuxGod-dev/kubesentinel/actions/workflows/ci.yml)
 
-Most K8s scanners hand you a flat list of misconfigurations. KubeSentinel does three extra things:
+**A Kubernetes security scanner that shows how an attacker could chain RBAC permissions into cluster-admin, and links every finding to the Falco rule that catches its exploitation.**
 
-1. **Escalation paths.** It builds a graph of who can become whom (create a pod as another ServiceAccount, exec into a pod and use its token, read token Secrets, impersonate, `bind`/`escalate`, `nodes/proxy`) and reports the *shortest chain* from every non-system identity to **cluster-admin**, **all Secrets**, or **node compromise**. Like [cloud-privesc-finder](https://github.com/LinuxGod-dev/cloud-privesc-finder), but for Kubernetes.
-2. **Detection linkage.** Every posture finding names the Falco rule that would catch someone *exploiting* it. `kubesentinel rules` prints the mapping, and tests enforce it.
-3. **Prove it.** A lab cluster, an attack manifest and per-rule trigger commands let you demonstrate offense → finding → alert end to end.
+Flat misconfiguration lists tell you *what is wrong*. KubeSentinel models *who can become whom*, reports the shortest escalation chain to cluster-admin, all Secrets or node compromise, and pairs each finding with a runtime detection.
 
-```
- manifests / live cluster ──► Inventory ──► checks: workload · rbac · secrets · network/PSA
- (kubectl, read-only)                 └──► RBAC graph ──► BFS ──► escalation paths
-                                                  │
-                    console · JSON · SARIF (GitHub Security tab) · HTML · Mermaid graph
-                                                  │
-        finding ──links to──► rules/falco/kubesentinel_rules.yaml (11 runtime rules, ATT&CK-tagged)
-```
-
-## What it checks
-
-| Area | Examples |
-|---|---|
-| Workloads (`KS-WL`) | privileged, hostPID/IPC/network, hostPath + container-runtime sockets, dangerous capabilities, root, privilege escalation, writable rootfs, limits, unpinned images, default SA token, seccomp |
-| RBAC (`KS-RBAC`) | cluster-admin grants, wildcards, `escalate`/`bind`/`impersonate`, secrets read, `pods/exec`, workload creation, `nodes/proxy`, token minting, default-SA and broad-group bindings |
-| Secrets (`KS-SEC`) | literal credentials in env vars, credentials in ConfigMaps, Secret objects committed to manifests (values are always masked in output) |
-| Network / admission | no NetworkPolicy, no default-deny, Pod Security Admission not enforced |
-| Escalation (`KS-ESC`) | shortest RBAC chain to cluster-admin / all secrets / node compromise |
-
-Run `kubesentinel rules` for the full catalog with MITRE ATT&CK IDs and linked Falco rules.
+**Contents:** [Overview](#overview--key-features) · [Architecture](#architecture) · [Repository structure](#repository-structure) · [Install](#prerequisites--installation) · [Quickstart](#quickstart) · [Lab & Falco](#lab--runtime-detection-setup) · [Testing](#testing) · [Roadmap & contributing](#roadmap--contributing) · [License](#license)
 
 ---
 
-# Step-by-step: run it locally
+## Overview & Key Features
 
-Work through the phases in order. **Every step ends with what you should see**, so you can confirm before moving on. If something differs, stop and fix it before continuing.
+Cloud security roles expect container and Kubernetes skills, yet most scanners stop at "this pod is privileged". Real clusters are rarely compromised through one bad setting. They fall to a *chain*: a CI service account that can only create pods, in a namespace that also hosts a cluster-admin service account. KubeSentinel finds those chains, shows the evidence, and tells the defender which Falco alert should fire when someone walks them.
 
-| Phase | Needs | What you get |
+- **RBAC privilege-escalation graph.** Builds a directed graph of subjects and finds the shortest path from every non-system identity to `CLUSTER-ADMIN`, `ALL CLUSTER SECRETS` or `NODE COMPROMISE`. Edges cover workload creation, `pods/exec`, token Secrets, token minting, impersonation, `escalate`/`bind`, and `nodes/proxy`.
+- **30 posture checks** across workloads, RBAC, secrets, network policy and Pod Security Admission, each with severity, remediation, CIS reference and MITRE ATT&CK ID (`kubesentinel rules` lists them).
+- **Falco integration.** 11 syscall-based runtime rules. Every finding names the rule that detects its exploitation, and the test suite fails if a link breaks.
+- **Two input modes.** Scan manifests (CI-friendly, no cluster needed) or a live cluster through read-only `kubectl`. Live mode never reads Secrets.
+- **Multi-format reporting.** Rich console output, JSON, SARIF 2.1.0 for GitHub code scanning, a self-contained HTML report, and a Mermaid graph of the escalation paths.
+- **CI gate.** `--fail-on <severity>` returns a non-zero exit code to block a build.
+- **Safe by design.** Matched secret values are always masked in output.
+- **Reproducible lab.** A deliberately vulnerable namespace set, a hardened baseline and an attack manifest on a `kind` cluster, so you can demonstrate offense → finding → alert end to end.
+
+| Area | Rule IDs | Examples |
 |---|---|---|
-| **A. Scanner on manifests** | Python 3.9+ only | the whole scanner, no cluster |
-| **B. Lab cluster + live scan** | + Docker, kind, kubectl | scan a real cluster, prove an escalation path |
-| **C. Falco runtime rules** | + Helm | alerts firing for the attacks |
+| Workloads | `KS-WL-001…011` | privileged, host namespaces, `hostPath` and runtime sockets, dangerous capabilities, root, writable rootfs, unpinned images |
+| RBAC | `KS-RBAC-001…010` | cluster-admin grants, wildcards, `escalate`/`bind`/`impersonate`, secrets read, `pods/exec`, `nodes/proxy`, default-SA bindings |
+| Secrets | `KS-SEC-001…003` | literal credentials in env vars, credentials in ConfigMaps, Secret objects in manifests |
+| Network / admission | `KS-NET-001…002`, `KS-ADM-001` | no NetworkPolicy, no default-deny, Pod Security not enforced |
+| Escalation paths | `KS-ESC-001…003` | shortest chain to cluster-admin / all Secrets / node compromise |
 
-Commands are shown for **bash** (Linux/macOS/WSL) and **PowerShell** (Windows) where they differ.
+---
 
-## Phase A: scanner only (no cluster)
+## Architecture
 
-**A1. Check Python.**
+```mermaid
+flowchart LR
+    subgraph IN["Inputs"]
+        MAN["Manifests<br/>YAML / JSON / rendered Helm"]
+        LIVE["Live cluster<br/>kubectl, read-only"]
+    end
+
+    subgraph CORE["Core engine (kubesentinel/)"]
+        LOAD["loader.py<br/>build Inventory"]
+        subgraph CHK["checks/"]
+            WL["workload"]
+            RB["rbac"]
+            SE["secrets"]
+            NE["network + PSA"]
+        end
+        MODEL["rbac_model.py<br/>effective permissions"]
+        ESC["escalation.py<br/>graph + shortest paths"]
+        CAT["catalog.py<br/>severity, CIS, MITRE, Falco links"]
+    end
+
+    subgraph OUT["Outputs"]
+        CON["Console tree"]
+        JS["JSON"]
+        SAR["SARIF<br/>GitHub Security tab"]
+        HT["HTML report"]
+        MM["Mermaid graph"]
+    end
+
+    FALCO["rules/falco/<br/>11 runtime detection rules"]
+
+    MAN --> LOAD
+    LIVE --> LOAD
+    LOAD --> WL
+    LOAD --> RB
+    LOAD --> SE
+    LOAD --> NE
+    LOAD --> MODEL
+    MODEL --> RB
+    MODEL --> ESC
+    WL --> FIND(("Findings"))
+    RB --> FIND
+    SE --> FIND
+    NE --> FIND
+    ESC --> FIND
+    CAT -.-> FIND
+    FIND --> CON
+    FIND --> JS
+    FIND --> SAR
+    FIND --> HT
+    ESC --> MM
+    CAT -. linked detections .-> FALCO
 ```
-python --version        # Windows: py --version
-```
-You should see `Python 3.9` or newer.
 
-**A2. Create and activate a virtual environment** (from the project folder).
+**Workflow:** inputs are loaded into one `Inventory`; the check modules and the RBAC model run over it; the escalation engine searches the permission graph with breadth-first search; everything lands in a single list of `Finding` objects that the reporters render. `catalog.py` is the single source of truth for severity, remediation and the link from each finding to a Falco rule.
+
+---
+
+## Repository Structure
+
+```
+kubesentinel/
+├── kubesentinel/                  # core Python package
+│   ├── cli.py                     #   argparse CLI: `scan`, `rules`
+│   ├── loader.py                  #   manifests / live kubectl -> Inventory
+│   ├── models.py                  #   Finding, Severity
+│   ├── catalog.py                 #   rule metadata, CIS/MITRE, Falco links
+│   ├── rbac_model.py              #   effective-permission model
+│   ├── escalation.py              #   permission graph + shortest-path search
+│   ├── scanner.py                 #   orchestrates all checks
+│   ├── report.py                  #   console, JSON, SARIF, HTML
+│   └── checks/                    #   workload.py · rbac.py · secrets.py · network.py
+├── labs/
+│   ├── kind-config.yaml           #   2-node kind cluster
+│   ├── vulnerable/                #   deliberately insecure namespaces, RBAC, workloads
+│   ├── baseline/                  #   hardened reference (should scan clean)
+│   └── attacks/steal-tiller.yaml  #   proves the ci-runner -> tiller -> cluster-admin path
+├── rules/falco/
+│   └── kubesentinel_rules.yaml    # 11 runtime detection rules
+├── tests/                         # pytest suite
+├── .github/workflows/ci.yml       # tests, SARIF upload, Falco rule validation
+├── reports/                       # generated output (git-ignored)
+├── pyproject.toml · requirements.txt · LICENSE
+```
+
+---
+
+## Prerequisites & Installation
+
+| Tool | Version | Needed for |
+|---|---|---|
+| Python | 3.9+ (developed on 3.12) | the scanner |
+| Docker | Desktop or Engine, **8 GiB RAM** for the 2-node lab (less for 1 node) | lab cluster |
+| kind | current | lab cluster |
+| kubectl | current | live scans and the lab |
+| Helm | 3.x | installing Falco |
+
+Only Python is needed to scan manifests. The other tools are for the [lab](#lab--runtime-detection-setup).
+
 ```bash
-# bash
-python3 -m venv .venv && source .venv/bin/activate
+git clone https://github.com/LinuxGod-dev/kubesentinel.git
+cd kubesentinel
 ```
-```powershell
-# PowerShell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-If PowerShell blocks the script: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`, then activate again.
-You should see `(.venv)` at the start of your prompt.
 
-**A3. Install.**
-```
+Create a virtual environment and install:
+
+```bash
+# Linux / macOS / WSL
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 ```
-You should see `Successfully installed ... kubesentinel-0.1.0 ...`.
+```powershell
+# Windows PowerShell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1      # if blocked: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+pip install -e ".[dev]"
+```
 
-**A4. Confirm the tool runs.**
-```
-kubesentinel --version
-```
-You should see `kubesentinel 0.1.0`. (If the command isn't found, use `python -m kubesentinel --version`.)
+`pip install -r requirements.txt` also works if you only want the dependencies. Verify:
 
-**A5. Run the tests.**
+```bash
+kubesentinel --version        # kubesentinel 0.1.0   (fallback: python -m kubesentinel --version)
 ```
-pytest -q
-```
-You should see `53 passed`.
 
-**A6. Scan the hardened baseline.**
-```
-kubesentinel scan labs/baseline
-```
-You should see a summary of all zeros and an empty findings table.
+Windows with kind/Falco: install the tools with `winget install Kubernetes.kind Kubernetes.kubectl Helm.Helm`.
 
-**A7. Scan the deliberately vulnerable lab.**
-```
+---
+
+## Quickstart
+
+The fastest way to see it work, with no cluster:
+
+```bash
 kubesentinel scan labs/vulnerable
 ```
-You should see roughly 10 CRITICAL / 16 HIGH findings, then a tree under **RBAC escalation paths**. Find this chain (the headline result):
-`ServiceAccount dev/support-bot → exec into a pod in 'ops' → ops/backup → dev/tiller → CLUSTER-ADMIN` (3 hops).
 
-**A8. See details, evidence and the linked Falco rules.**
+On the lab this reports 10 CRITICAL, 16 HIGH, 12 MEDIUM and 11 LOW findings, then the escalation paths. Abridged:
+
 ```
+RBAC escalation paths (shortest chain per source and target)
+→ CLUSTER-ADMIN  (5 source(s))
+├── ServiceAccount dev/ci-runner  2 hop(s)
+│   ├── ServiceAccount dev/ci-runner ── create a workload in 'dev' that runs as dev/tiller (RoleBinding dev/ci-runner-deployer -> Role ci-deployer) ──▶ ServiceAccount dev/tiller
+│   └── ServiceAccount dev/tiller ── already holds cluster-admin-equivalent rights (ClusterRoleBinding tiller-admin -> ClusterRole cluster-admin) ──▶ CLUSTER-ADMIN
+```
+
+A service account that can *only create pods in one namespace* reaches cluster-admin in two hops. The hardened baseline scans clean: `kubesentinel scan labs/baseline`.
+
+### Common commands
+
+| Command | What it does |
+|---|---|
+| `kubesentinel scan PATH...` | scan manifest files or directories (YAML/JSON) |
+| `kubesentinel scan --live` | scan the current `kubectl` context (read-only) |
+| `kubesentinel rules` | list every check with MITRE IDs and linked Falco rules |
+
+| Flag | Purpose |
+|---|---|
+| `--context NAME` | kubectl context to use with `--live` |
+| `--exclude-namespace NS` | skip a namespace (repeatable), e.g. `kube-system` |
+| `--include-system` | treat `system:*` and `kube-system` identities as path sources |
+| `--min-severity LEVEL` | hide findings below `info`/`low`/`medium`/`high`/`critical` |
+| `-v`, `--verbose` | show messages, evidence, remediation and linked detections |
+| `--fail-on LEVEL` | exit `1` if any finding is at or above `LEVEL` (CI gate) |
+| `--json FILE` · `--sarif FILE` · `--html FILE` · `--mermaid FILE` | write reports |
+| `--quiet` | no console output |
+
+```bash
+# Evidence, remediation and the Falco rule for each high+ finding
 kubesentinel scan labs/vulnerable --verbose --min-severity high
-```
-Each finding now shows evidence, a fix, and `runtime detection: <Falco rule names>`.
 
-**A9. Produce the reports.**
-```
-kubesentinel scan labs/vulnerable --min-severity critical --html reports/report.html --json reports/report.json --sarif reports/report.sarif --mermaid reports/paths.mmd
-```
-You should see the normal console output followed by four `wrote ...` lines. Open `reports/report.html` in a browser (it follows your light/dark setting). Paste the contents of `reports/paths.mmd` into <https://mermaid.live> to see the escalation graph.
+# All report formats at once
+kubesentinel scan labs/vulnerable --html reports/report.html --json reports/report.json \
+  --sarif reports/report.sarif --mermaid reports/paths.mmd
 
-**A10. Try the CI gate.**
+# CI: render Helm, fail the build on HIGH or worse, publish to GitHub's Security tab
+helm template ./chart > rendered.yaml
+kubesentinel scan rendered.yaml --fail-on high --sarif kubesentinel.sarif
+```
+
+Paste `reports/paths.mmd` into <https://mermaid.live> to see the escalation graph. Helm and Kustomize templates cannot be parsed directly; render them first (`helm template`, `kubectl kustomize`). Files that fail to parse are reported as warnings, never dropped silently.
+
+---
+
+## Lab / Runtime Detection Setup
+
+> The lab manifests are **intentionally insecure** and contain fake credentials. Run them only in a throw-away cluster.
+
+### 1. Create the cluster
+
 ```bash
-kubesentinel scan labs/vulnerable --quiet --fail-on high; echo "exit code: $?"     # bash
+kind create cluster --config labs/kind-config.yaml     # 2 nodes
+kubectl get nodes                                       # expect 2 x Ready
 ```
-```powershell
-kubesentinel scan labs/vulnerable --quiet --fail-on high; "exit code: $LASTEXITCODE"
-```
-You should see `exit code: 1`. The same command on `labs/baseline` gives `0`.
 
-Phase A is a complete, working project. Phases B and C add a real cluster and runtime detection.
+**If it fails** with `could not find a log line that matches "Reached target ..."`, the node ran out of resources (common on Docker Desktop/WSL2 with under ~6 GiB). Check `docker info | grep -E "Cgroup Version|CPUs|Total Memory"`, raise memory (Windows: set `memory=8GB` in `%UserProfile%\.wslconfig`, then `wsl --shutdown` and restart Docker Desktop), or use a single node, which still runs every lab step:
 
-## Phase B: lab cluster and live scan
-
-**B1. Install the tools** (skip any you have). Docker Desktop (Windows: WSL2 backend) must be *running*.
-```powershell
-# Windows
-winget install Kubernetes.kind Kubernetes.kubectl Helm.Helm
-```
 ```bash
-# macOS
-brew install kind kubectl helm
-# Linux: see https://kind.sigs.k8s.io/docs/user/quick-start/#installation
+kind delete cluster --name kubesentinel
+kind create cluster --name kubesentinel
 ```
-Open a **new** terminal, then check:
-```
-docker version && kind version && kubectl version --client && helm version
-```
-All four should print versions (Docker needs both Client and Server sections).
 
-**B2. Create the cluster.**
-```
-kind create cluster --config labs/kind-config.yaml
-```
-You should see `Set kubectl context to "kind-kubesentinel"`.
+If the node log mentions `inotify`, run `wsl -d docker-desktop sysctl -w fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=512` (resets on restart). Get the log with `kind create cluster --name kubesentinel --retain` then `docker logs kubesentinel-control-plane --tail 60`.
 
-**B3. Confirm the nodes.**
-```
-kubectl get nodes
-```
-You should see 2 nodes, both `Ready` (may take ~1 minute).
+### 2. Deploy the vulnerable lab and scan the live cluster
 
-**B4. Deploy the vulnerable lab.**
-```
+```bash
 kubectl apply -f labs/vulnerable/
-```
-You should see namespaces, service accounts, roles, bindings, pods and deployments `created`. The `Secret` and ConfigMap are included on purpose.
-
-**B5. Wait for the pods.**
-```
-kubectl get pods -A
-```
-In `dev` and `ops` you should see `attacker-pod`, `payments-api` and `backup-agent` reach `Running`. (First pull takes a minute.)
-
-**B6. Run the live scan.**
-```
+kubectl get pods -A                                     # attacker-pod, payments-api, backup-agent -> Running
 kubesentinel scan --live --exclude-namespace kube-system --min-severity high
 ```
-You should see the same classes of findings as Phase A, now read from the cluster (`live cluster` in the header). Note the line saying Secret objects are not read: live mode never fetches Secrets, by design.
 
-**B7. Prove the headline finding is real.** First ask the API server what `ci-runner` can do:
-```
-kubectl auth can-i create pods -n dev --as=system:serviceaccount:dev:ci-runner
-kubectl auth can-i "*" "*" --as=system:serviceaccount:dev:ci-runner
-```
-You should see `yes` then `no`. It is *not* admin, yet the scanner says it reaches cluster-admin in 2 hops. Now exploit the path, creating a pod **as ci-runner** that runs as `tiller`:
-```
+### 3. Prove the headline finding
+
+`ci-runner` can only create pods in `dev`, yet the scanner says it reaches cluster-admin. Verify, then exploit:
+
+```bash
+kubectl auth can-i create pods -n dev --as=system:serviceaccount:dev:ci-runner      # yes
+kubectl auth can-i "*" "*"           --as=system:serviceaccount:dev:ci-runner      # no
 kubectl create -f labs/attacks/steal-tiller.yaml --as=system:serviceaccount:dev:ci-runner
+kubectl logs -n dev steal-tiller          # "ACCESS GRANTED" + the start of a SecretList from kube-system
 ```
-You should see `pod/steal-tiller created`. Wait a few seconds, then:
-```
-kubectl logs -n dev steal-tiller
-```
-You should see `ACCESS GRANTED - first bytes of the response:` followed by `{"kind":"SecretList"...`. A non-admin identity just read `kube-system` Secrets. That is the finding, proven.
 
-**B8. Fix it and re-scan** (optional, to see the scanner react). Enforce Pod Security on `dev` and re-run:
-```
-kubectl label namespace dev pod-security.kubernetes.io/enforce=baseline --overwrite
-kubesentinel scan --live --exclude-namespace kube-system --min-severity high
-```
-The `NODE COMPROMISE` paths through `dev` should disappear, and `KS-ADM-001` for `dev` goes away. (The tiller chain remains: PSA doesn't fix RBAC. Remove the cluster-admin binding for that.)
+Fix and re-scan: `kubectl label namespace dev pod-security.kubernetes.io/enforce=baseline --overwrite` removes the node-compromise paths through `dev`. The tiller chain remains, because Pod Security does not fix RBAC. Remove the cluster-admin binding for that.
 
-## Phase C: Falco runtime detections
+### 4. Install Falco with the KubeSentinel rules
 
-> Falco needs kernel access. This works best on a native Linux host or Linux VM. On Docker Desktop/WSL2 it may work with the modern eBPF driver, but if the Falco pod crash-loops, read `kubectl logs -n falco <pod>` for a driver error. Phases A and B do not depend on it.
+> Falco needs kernel access: it is most reliable on a native Linux host or VM. On Docker Desktop/WSL2 it may work with the modern eBPF driver; if the pod crash-loops, read its logs for a driver error.
 
-**C1. Validate the rule file syntax** (needs Docker).
+Validate the rules, then install:
+
 ```bash
-docker run --rm -v "$PWD/rules/falco:/rules:ro" falcosecurity/falco-no-driver:latest falco --validate /rules/kubesentinel_rules.yaml
-```
-```powershell
-docker run --rm -v "${PWD}/rules/falco:/rules:ro" falcosecurity/falco-no-driver:latest falco --validate /rules/kubesentinel_rules.yaml
-```
-You should see a line ending in `Ok`. If Falco reports an error, it names the line; fix it before continuing. (The rules were schema-checked by the test-suite, but run this on *your* Falco version.)
+docker run --rm -v "$PWD/rules/falco:/rules:ro" falcosecurity/falco-no-driver:latest \
+  falco --validate /rules/kubesentinel_rules.yaml
 
-**C2. Install Falco with the KubeSentinel rules.**
-```bash
 helm repo add falcosecurity https://falcosecurity.github.io/charts && helm repo update
 helm install falco falcosecurity/falco -n falco --create-namespace \
   --set driver.kind=modern_ebpf --set tty=true \
   --set-file "customRules.kubesentinel\.yaml=rules/falco/kubesentinel_rules.yaml"
-```
-(PowerShell: put it on one line instead of using `\` continuations.) If the chart rejects a value, check the chart's `values.yaml` for the current name of the `driver` and `customRules` keys.
-
-**C3. Wait for Falco.**
-```
-kubectl get pods -n falco
-```
-You should see the Falco pod(s) `Running` (`2/2` or `1/1`).
-
-**C4. Confirm the rules loaded.**
-```
-kubectl logs -n falco -l app.kubernetes.io/name=falco -c falco --tail=200
-```
-Look for a line mentioning `kubesentinel.yaml` and `Falco initialized`.
-
-**C5. Watch alerts.** Open a **second terminal** and leave this running:
-```
-kubectl logs -n falco -l app.kubernetes.io/name=falco -c falco -f
+kubectl get pods -n falco                               # expect Running
 ```
 
-**C6. Trigger the rules one at a time** from the first terminal. After each, look at the alert terminal before moving on.
+(PowerShell: use `${PWD}` in the `-v` path and put the `helm install` command on one line. If the chart rejects a value, check its `values.yaml` for the current `driver` and `customRules` key names.)
 
-| # | Run | Expect this alert |
+### 5. Trigger the detections
+
+In a second terminal, watch alerts: `kubectl logs -n falco -l app.kubernetes.io/name=falco -c falco -f`. Then run these one at a time:
+
+| # | Command | Expected alert |
 |---|---|---|
-| 1 | `kubectl exec -it -n dev attacker-pod -- sh` (then `exit`) | Interactive Shell in Container |
+| 1 | `kubectl exec -it -n dev attacker-pod -- sh` | Interactive Shell in Container |
 | 2 | `kubectl exec -n dev attacker-pod -- cat /var/run/secrets/kubernetes.io/serviceaccount/token` | ServiceAccount Token Read by Suspicious Process |
 | 3 | `kubectl exec -n dev attacker-pod -- apk add --no-cache curl` | Package Manager Run in Container |
 | 4 | `kubectl exec -n dev attacker-pod -- sh -c "echo --donate-level 1 stratum+tcp://pool.invalid:3333"` | Crypto Miner Activity in Container |
-| 5 | `kubectl exec -n dev attacker-pod -- nsenter -t 1 -m -u -i -n -p -- hostname` | Container Escape via nsenter (prints the *node's* hostname) |
+| 5 | `kubectl exec -n dev attacker-pod -- nsenter -t 1 -m -u -i -n -p -- hostname` | Container Escape via nsenter |
 | 6 | `kubectl exec -n dev attacker-pod -- mount -t tmpfs none /mnt` | Mount Syscall in Container |
 | 7 | `kubectl exec -n dev attacker-pod -- wget -qO- --no-check-certificate https://kubernetes.default.svc/version` | Kubernetes API Client in Container |
 | 8 | `kubectl exec -n dev attacker-pod -- cat /etc/shadow` | Sensitive Credential File Read in Container |
 | 9 | `kubectl exec -n dev attacker-pod -- sh -c "echo test >> /etc/ks-test"` | Write to Sensitive Directory in Container |
 
-Each alert includes namespace, pod, container, process and command line. Notes: row 5 needs `nsenter` in the image (if it says `not found`, run `kubectl exec -n dev attacker-pod -- apk add --no-cache util-linux` first); the `steal-tiller` pod from B7 also fires rows 2 and 7 by itself. The **runtime-socket** and **reverse-shell** rules are not simulated here.
+Row 5 needs `nsenter` in the image (if missing: `kubectl exec -n dev attacker-pod -- apk add --no-cache util-linux`). The `steal-tiller` pod from step 3 also fires rows 2 and 7. The runtime-socket and reverse-shell rules are not simulated. Tune the allow-lists at the top of `rules/falco/kubesentinel_rules.yaml` to cut false positives in your environment.
 
-**C7. Close the loop.** `kubesentinel rules` shows which Falco rule backs each posture check, so you can state: *"This cluster had a path to cluster-admin (KS-ESC-001); here is the alert that fired when I exploited it."*
+### 6. Clean up
 
-## Cleanup
-```
+```bash
 kind delete cluster --name kubesentinel
 ```
 
 ---
 
-# Using it for real
+## Testing
 
 ```bash
-# CI: scan rendered manifests, fail the build on HIGH+, publish SARIF to GitHub's Security tab
-helm template ./chart > rendered.yaml
-kubesentinel scan rendered.yaml --fail-on high --sarif kubesentinel.sarif
+pytest -q
 ```
-Use `--exclude-namespace` to skip namespaces (e.g. `kube-system`), and `--include-system` to treat `system:*` and `kube-system` identities as path sources.
 
-Helm/Kustomize templates can't be parsed directly: render them first (`helm template`, `kubectl kustomize`). Files that fail to parse are reported as warnings, never silently dropped.
+Expected: `53 passed`. The suite covers:
 
-## Tuning Falco
+- every check family, including positive and negative cases (benign `hostPath`, `valueFrom` secrets, placeholders, `resourceNames`)
+- escalation paths on the lab: the 2-hop and 3-hop chains, direct RBAC self-escalation, Pod Security removing node paths, admin identities treated as sinks
+- live mode against a fake `kubectl`: it is read-only, never requests Secrets, and skips controller-owned pods
+- the Falco rule file: schema, unique names, every `ks_` macro/list defined, every finding linked to an existing rule, every rule linked from a finding
+- reports and CLI: JSON, SARIF and HTML output, the `--fail-on` gate, and a check that secret values never appear in any report
 
-Edit the allow-lists at the top of `rules/falco/kubesentinel_rules.yaml` (`ks_write_allowed_procs`, `ks_shadow_allowed_procs`) for your images. The shell and token rules are intentionally narrow (TTY shells, utility binaries) to keep them low-noise.
+The CI workflow (`.github/workflows/ci.yml`) runs the tests on Python 3.9, 3.11 and 3.12, uploads SARIF for the lab scan to the Security tab, and validates the Falco rules.
 
-## Adding a check
+---
 
-1. Add a `Rule` to `kubesentinel/catalog.py` (severity, remediation, MITRE, linked Falco rule names).
+## Roadmap & Contributing
+
+**Roadmap**
+
+- [ ] Kubernetes audit-log Falco rules (e.g. privileged pod created)
+- [ ] Kyverno / Gatekeeper-aware admission checks
+- [ ] Attack-path graph embedded in the HTML report
+- [ ] Helm chart for scheduled in-cluster scans
+- [ ] MITRE ATT&CK for Containers coverage matrix
+
+**Known limitations** (read before trusting a result)
+
+- `apiGroups` are ignored when matching RBAC resources, which can over-report.
+- Built-in ClusterRoles (`admin`, `edit`, `view`) are approximated when scanning manifests; live mode reads the real aggregated rules.
+- "Read Secrets → use token" edges only apply where long-lived token Secrets exist; modern clusters do not create them by default. The path text says so.
+- Rules restricted by `resourceNames` are ignored for capability checks, except impersonation.
+- Pod Security is read from namespace labels only, so Kyverno/Gatekeeper users may see false `KS-ADM-001` findings.
+- CIS references follow benchmark v1.8 numbering and are approximate.
+- KubeSentinel is narrow on purpose. For broad compliance coverage use Trivy, kube-bench or Kubescape alongside it.
+
+**Contributing**
+
+Issues and pull requests are welcome. For bugs, open an issue with the command you ran, the manifests (with secrets removed) and the output. For a new check:
+
+1. Add a `Rule` to `kubesentinel/catalog.py` (severity, remediation, MITRE ID, linked Falco rule names).
 2. Implement it in the matching module under `kubesentinel/checks/` using `make_finding("KS-...", ...)`.
-3. Add a test. `tests/test_falco_rules.py` fails if a link points at a Falco rule that doesn't exist, or a Falco rule isn't linked from any check.
+3. Add tests, including a negative case, and run `pytest -q`. The Falco cross-link tests will fail if a link points at a missing rule.
+4. Never commit real credentials. Lab fixtures must use obviously fake values.
 
-## Design notes and limitations (read before trusting a result)
-
-- **apiGroups are ignored** when matching RBAC resources (lenient: may over-report, e.g. a custom resource named `pods`).
-- **Built-in ClusterRoles** (`cluster-admin`, `admin`, `edit`, `view`) are approximated when scanning manifests; **live mode reads the real, aggregated rules** from the cluster.
-- **Already-admin subjects are sinks:** a subject holding cluster-admin is reported once (`KS-RBAC-001`) and paths *through* it end at CLUSTER-ADMIN, rather than also listing node/secret paths it trivially subsumes.
-- **Token-theft edges** ("read Secrets → use ServiceAccount token") only apply when long-lived token Secrets exist; modern clusters don't create them by default. The path text says so.
-- **Rules with `resourceNames`** are ignored for capability checks (can't prove broad access), except for impersonation.
-- **Pod Security** is read from namespace labels only; clusters enforcing policy via Kyverno/Gatekeeper will show `KS-ADM-001` false positives.
-- **Admission/audit-log detections** (e.g. "privileged pod created") need Kubernetes audit events and are not included; the Falco rules are syscall-based.
-- CIS references follow benchmark v1.8 numbering and are approximate; verify against your version.
-- Compared with Trivy, kube-bench or Kubescape, KubeSentinel is **narrow on purpose**: RBAC path analysis plus detections linked to findings, not broad compliance coverage.
-
-## Roadmap
-
-K8s audit-log Falco rules · Kyverno/Gatekeeper-aware admission checks · attack-path graph in the HTML report · Helm chart for in-cluster scheduled scans · MITRE ATT&CK for Containers coverage matrix.
+---
 
 ## License
 
-MIT. See [LICENSE](LICENSE). **Lab manifests are intentionally insecure; run them only in a throw-away cluster.**
+Released under the MIT License. See [LICENSE](LICENSE).
